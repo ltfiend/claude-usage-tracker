@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll Claude Code usage limits and record cycle-end utilization
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/peter/Git/claude-usage-tracker/bin/claude-usage-tracker
+# Must exceed the script's max pre-reset sleep (480s) plus fetch time
+TimeoutStartSec=600
+Environment=PYTHONUNBUFFERED=1
+Nice=10

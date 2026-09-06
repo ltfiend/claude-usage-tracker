@@ -1,0 +1,13 @@
+[Unit]
+Description=Run claude-usage-tracker every 5 minutes
+
+[Timer]
+OnBootSec=2min
+# Measured from the END of the previous run, so a run that slept until a
+# reset cannot stack against the next fire (keeps API calls >=180s apart).
+OnUnitActiveSec=5min
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

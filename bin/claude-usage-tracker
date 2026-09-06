@@ -1,0 +1,289 @@
+#!/usr/bin/python3
+"""Record Claude Code usage-limit utilization, catching each 5h/7d cycle end.
+
+One run = one poll. Fetches the current 5-hour and 7-day window utilization
+(OAuth usage endpoint, falling back to the statusline snapshot file), appends
+it to history.jsonl, and when a window's resets_at advances past the one held
+in state.json, writes the previous sample — the last observation of the old
+cycle — as that cycle's closing row in cycles.csv. If a reset lands before
+the next timer fire, the run sleeps and takes one extra sample just before
+the reset so the closing value is at most ~60s stale.
+
+Test/env hooks:
+  CUT_DATA_DIR=<dir>     use a different data directory
+  CUT_FORCE_FALLBACK=1   skip the API, exercise the snapshot fallback
+  CUT_FAKE_RESET_IN=<s>  pretend the 5h window resets <s> seconds from now
+"""
+
+import csv
+import fcntl
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+# Undocumented endpoint: needs the oauth beta header and a claude-code
+# User-Agent (without one it returns persistent 429s), and calls must stay
+# >= API_MIN_INTERVAL apart.
+API_HEADERS = {
+    "anthropic-beta": "oauth-2025-04-20",
+    "User-Agent": "claude-code/2.1.0",
+    "Accept": "application/json",
+}
+API_MIN_INTERVAL = 180
+TIMER_INTERVAL = 300          # must match OnUnitActiveSec in the .timer unit
+PRE_RESET_MARGIN = 60         # aim to sample this long before a reset
+MAX_SLEEP = 480               # < TimeoutStartSec in the .service unit
+FALLBACK_MAX_AGE = 6 * 3600
+CLOSED_RING_SIZE = 20
+
+HOME = Path.home()
+DATA_DIR = Path(os.environ.get("CUT_DATA_DIR") or HOME / ".local/share/claude-usage-tracker")
+CREDS_PATH = HOME / ".claude/.credentials.json"
+SNAPSHOT_PATH = HOME / ".claude/abtop-rate-limits.json"
+HISTORY_PATH = DATA_DIR / "history.jsonl"
+CYCLES_PATH = DATA_DIR / "cycles.csv"
+STATE_PATH = DATA_DIR / "state.json"
+LOCK_PATH = DATA_DIR / ".lock"
+
+# tracked window name -> key used by both the API and the snapshot file
+WINDOWS = {"5h": "five_hour", "7d": "seven_day"}
+
+CSV_HEADER = [
+    "window", "cycle_end_epoch", "cycle_end_iso", "pct_used",
+    "sampled_at_epoch", "sampled_at_iso", "sample_age_seconds", "source",
+]
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def iso(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def parse_resets_at(value):
+    """resets_at is epoch seconds in the snapshot but ISO 8601 from the API."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    return None
+
+
+def normalize(payload, source, sampled_at, error=None):
+    windows = {}
+    for name, key in WINDOWS.items():
+        w = payload.get(key) if isinstance(payload, dict) else None
+        if not isinstance(w, dict):
+            continue
+        pct = w.get("utilization", w.get("used_percentage"))
+        resets_at = parse_resets_at(w.get("resets_at"))
+        if pct is None or resets_at is None:
+            continue
+        windows[name] = {
+            "pct": float(pct),
+            "resets_at": resets_at,
+            "resets_at_iso": iso(resets_at),
+        }
+    return {
+        "ts": sampled_at,
+        "ts_iso": iso(sampled_at),
+        "source": source,
+        "error": error,
+        "windows": windows,
+        "raw": payload,
+    }
+
+
+def fetch_api(now):
+    creds = read_json(CREDS_PATH)
+    oauth = creds.get("claudeAiOauth") if isinstance(creds, dict) else None
+    if not isinstance(oauth, dict) or not oauth.get("accessToken"):
+        raise RuntimeError(f"no OAuth credentials in {CREDS_PATH}")
+    # expiresAt is epoch milliseconds; never refresh the token ourselves —
+    # that is Claude Code's job and doing it here could rotate its tokens.
+    if oauth.get("expiresAt", 0) / 1000 <= now + 30:
+        raise RuntimeError("access token expired (run Claude Code to refresh it)")
+    req = urllib.request.Request(
+        USAGE_URL,
+        headers={"Authorization": f"Bearer {oauth['accessToken']}", **API_HEADERS},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        payload = json.load(resp)
+    return normalize(payload, "api", time.time())
+
+
+def fetch_fallback(now):
+    snap = read_json(SNAPSHOT_PATH)
+    if not isinstance(snap, dict):
+        raise RuntimeError(f"no snapshot at {SNAPSHOT_PATH}")
+    updated_at = snap.get("updated_at")
+    if not isinstance(updated_at, (int, float)):
+        raise RuntimeError("snapshot has no updated_at")
+    if now - updated_at > FALLBACK_MAX_AGE:
+        raise RuntimeError(f"snapshot stale ({(now - updated_at) / 3600:.1f}h old)")
+    return normalize(snap, "fallback", float(updated_at))
+
+
+def fetch_sample(now, allow_api=True):
+    errors = []
+    if allow_api and not os.environ.get("CUT_FORCE_FALLBACK"):
+        try:
+            return fetch_api(now)
+        except (urllib.error.URLError, TimeoutError, RuntimeError) as e:
+            errors.append(f"api: {e}")
+            log(f"api fetch failed, trying fallback: {e}")
+    try:
+        return fetch_fallback(now)
+    except RuntimeError as e:
+        errors.append(f"fallback: {e}")
+    return normalize(None, "miss", now, error="; ".join(errors))
+
+
+def append_history(sample):
+    with open(HISTORY_PATH, "a") as f:
+        f.write(json.dumps(sample, separators=(",", ":")) + "\n")
+
+
+def append_cycle_row(window, prev):
+    write_header = not CYCLES_PATH.exists()
+    with open(CYCLES_PATH, "a", newline="") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(CSV_HEADER)
+        cycle_end = prev["resets_at"]
+        sampled_at = prev["last_sampled_at"]
+        writer.writerow([
+            window, int(cycle_end), iso(cycle_end), prev["last_pct"],
+            int(sampled_at), iso(sampled_at), int(cycle_end - sampled_at),
+            prev["last_source"],
+        ])
+    log(f"cycle closed: {window} ended {iso(cycle_end)} at "
+        f"{prev['last_pct']}% (sampled {int(cycle_end - sampled_at)}s before end)")
+
+
+def detect_rollovers(state, sample):
+    tracked = state.setdefault("windows", {})
+    closed = state.setdefault("closed", {})
+    for window, cur in sample["windows"].items():
+        prev = tracked.get(window)
+        if prev and cur["resets_at"] > prev["resets_at"] + 1:
+            ring = closed.setdefault(window, [])
+            # dedupe on the old cycle's resets_at: one CSV row per cycle
+            if prev["resets_at"] not in ring:
+                append_cycle_row(window, prev)
+                ring.append(prev["resets_at"])
+                del ring[:-CLOSED_RING_SIZE]
+        # Track only live windows, and never let an older (fallback) sample
+        # regress a newer stored observation.
+        if cur["resets_at"] > sample["ts"] and (
+            prev is None
+            or sample["ts"] >= prev["last_sampled_at"]
+            or cur["resets_at"] > prev["resets_at"] + 1
+        ):
+            tracked[window] = {
+                "resets_at": cur["resets_at"],
+                "last_pct": cur["pct"],
+                "last_sampled_at": sample["ts"],
+                "last_source": sample["source"],
+            }
+
+
+def save_state(state):
+    tmp = STATE_PATH.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, STATE_PATH)
+
+
+def summarize(sample):
+    parts = [f"source={sample['source']}"]
+    for window, w in sample["windows"].items():
+        parts.append(f"{window}={w['pct']}% resets {w['resets_at_iso']}")
+    if sample["error"]:
+        parts.append(f"error={sample['error']}")
+    return " ".join(parts)
+
+
+def maybe_sleep_and_resample(state, sample):
+    """If a reset lands before the next timer fire, sample right before it."""
+    now = time.time()
+    last_api_fetch = sample["ts"] if sample["source"] == "api" else 0
+    targets = [
+        w["resets_at"]
+        for w in sample["windows"].values()
+        if now + 45 < w["resets_at"] - PRE_RESET_MARGIN < now + TIMER_INTERVAL
+    ]
+    if not targets:
+        return
+    reset_at = min(targets)
+    wake = reset_at - PRE_RESET_MARGIN
+    # keep API calls >= API_MIN_INTERVAL apart, but never sleep past the reset
+    earliest_api = last_api_fetch + API_MIN_INTERVAL
+    if earliest_api > wake:
+        wake = min(earliest_api, reset_at - 30)
+    sleep_for = min(max(wake - now, 0), MAX_SLEEP)
+    log(f"reset at {iso(reset_at)} is near; sleeping {sleep_for:.0f}s for a closing sample")
+    time.sleep(sleep_for)
+    now = time.time()
+    sample2 = fetch_sample(now, allow_api=now - last_api_fetch >= API_MIN_INTERVAL)
+    append_history(sample2)
+    detect_rollovers(state, sample2)
+    save_state(state)
+    log(f"pre-reset sample: {summarize(sample2)}")
+
+
+def apply_fake_reset(sample, now):
+    fake_in = os.environ.get("CUT_FAKE_RESET_IN")
+    if not fake_in:
+        return
+    resets_at = now + float(fake_in)
+    window = sample["windows"].setdefault("5h", {"pct": 0.0})
+    window.update({"resets_at": resets_at, "resets_at_iso": iso(resets_at)})
+    log(f"CUT_FAKE_RESET_IN: pretending 5h resets at {iso(resets_at)}")
+
+
+def main():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log("another run holds the lock; exiting")
+        return 0
+
+    now = time.time()
+    state = read_json(STATE_PATH) or {}
+    sample = fetch_sample(now)
+    apply_fake_reset(sample, now)
+    append_history(sample)
+    detect_rollovers(state, sample)
+    save_state(state)
+    log(summarize(sample))
+    maybe_sleep_and_resample(state, sample)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
